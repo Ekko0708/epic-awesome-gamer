@@ -36,7 +36,6 @@ URL_STORE_EXPLORER_GRAPHQL = (
     '&extensions={"persistedQuery":{"version":1,"sha256Hash":"13a2b6787f1a20d05c75c54c78b1b8ac7c8bf4efc394edf7a5998fdf35d1adb0"}}'
 )
 
-
 # fmt:on
 
 
@@ -72,7 +71,7 @@ class CommonHandler:
         with suppress(Exception):
             await expect(payment_btn).to_be_attached()
         await page.wait_for_timeout(2000)
-        await payment_btn.click()
+        await payment_btn.click(timeout=6000)
 
         return wpc, payment_btn
 
@@ -182,7 +181,7 @@ class EpicGames:
                         return
 
         await page.goto(URL_CLAIM, wait_until="domcontentloaded")
-        while await page.locator('a[role="button"]:has-text("Sign In")').count() > 0:
+        if "false" == await page.locator("//egs-navigation").get_attribute("isloggedin"):
             await page.goto(URL_LOGIN, wait_until="domcontentloaded")
             logger.info("login-with-email", url=page.url)
 
@@ -201,16 +200,22 @@ class EpicGames:
             await insert_challenge(stage="login_prod")
 
         logger.success("login", result="Successfully refreshed tokens")
+        await page.goto(URL_CLAIM, wait_until="domcontentloaded")
         return self._solver.status.CHALLENGE_SUCCESS
 
     async def authorize(self, page: Page):
-        for _ in range(3):
-            match await self._login(page):
-                case self._solver.status.CHALLENGE_SUCCESS:
-                    return True
-                case _:
-                    continue
-        logger.critical("Failed to flush token", agent=self.__class__.__name__)
+        for i in range(3):
+            try:
+                match await self._login(page):
+                    case self._solver.status.CHALLENGE_SUCCESS:
+                        return True
+                    case _:
+                        continue
+            except TimeoutError:
+                logger.warning("执行超时", task="authorize", retry=i)
+                continue
+
+        raise RuntimeError(f"Failed to flush token - agent={self.__class__.__name__}")
 
     async def flush_token(self, context: BrowserContext) -> Dict[str, str] | None:
         page = context.pages[0]
@@ -275,6 +280,8 @@ class EpicGames:
         await page.wait_for_url(recur_url)
         logger.success("claim_weekly_games", action="success", url=page.url)
 
+        return True
+
     async def claim_bundle_games(self, page: Page, promotions: List[Game]):
         for promotion in promotions:
             logger.info("claim_bundle_games", action="go to store", url=promotion.url)
@@ -315,6 +322,8 @@ class EpicGames:
             await page.wait_for_url(recur_url)
             logger.success("claim_bundle_games", action="success", url=page.url)
 
+            return True
+
 
 def get_promotions() -> List[Game]:
     """
@@ -324,36 +333,41 @@ def get_promotions() -> List[Game]:
     <本周免费> promotion["promotions"]["promotionalOffers"]
     :return: {"pageLink1": "pageTitle1", "pageLink2": "pageTitle2", ...}
     """
+
+    def _has_discount_target(prot: dict) -> bool | None:
+        with suppress(KeyError, IndexError, TypeError):
+            offers = prot["promotions"]["promotionalOffers"][0]["promotionalOffers"]
+            for i, offer in enumerate(offers):
+                if offer["discountSetting"]["discountPercentage"] == 0:
+                    return True
+
     _promotions: List[Game] = []
 
     params = {"local": "zh-CN"}
     resp = httpx.get(URL_PROMOTIONS, params=params)
     try:
         data = resp.json()
-    except JSONDecodeError:
-        pass
+    except JSONDecodeError as err:
+        logger.error("Failed to get promotions", err=err)
     else:
         elements = data["data"]["Catalog"]["searchStore"]["elements"]
         promotions = [e for e in elements if e.get("promotions")]
-        # 获取商城促销数据&&获取<本周免费>的游戏对象
+        # Get store promotion data and <this week free> games
         for promotion in promotions:
-            if offer := promotion["promotions"]["promotionalOffers"]:
-                # 去除打折了但只打一点点的商品
-                with suppress(KeyError, IndexError):
-                    offer = offer[0]["promotionalOffers"][0]
-                    if offer["discountSetting"]["discountPercentage"] != 0:
-                        continue
-                try:
-                    query = promotion["catalogNs"]["mappings"][0]["pageSlug"]
-                    promotion["url"] = f"{URL_PRODUCT_PAGE}{query}"
-                except TypeError:
-                    promotion["url"] = f"{URL_PRODUCT_BUNDLES}{promotion['productSlug']}"
-                except IndexError:
-                    promotion["url"] = f"{URL_PRODUCT_PAGE}{promotion['productSlug']}"
+            # Remove items that are discounted but not free.
+            if not _has_discount_target(promotion):
+                continue
+            # package free games
+            try:
+                query = promotion["catalogNs"]["mappings"][0]["pageSlug"]
+                promotion["url"] = f"{URL_PRODUCT_PAGE}{query}"
+            except TypeError:
+                promotion["url"] = f"{URL_PRODUCT_BUNDLES}{promotion['productSlug']}"
+            except IndexError:
+                promotion["url"] = f"{URL_PRODUCT_PAGE}{promotion['productSlug']}"
 
-                promotion["thumbnail"] = promotion["keyImages"][-1]["url"]
-
-                _promotions.append(from_dict_to_model(Game, promotion))
+            promotion["thumbnail"] = promotion["keyImages"][-1]["url"]
+            _promotions.append(from_dict_to_model(Game, promotion))
 
     return _promotions
 
